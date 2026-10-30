@@ -3,6 +3,10 @@ use crate::{
     transport,
 };
 use eframe::egui::{self, Color32, RichText, Vec2, ViewportCommand};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+unsafe extern "C" {
+    fn window_aspect(handle: *mut std::ffi::c_void, ratio: f64, header: i32, minimum: i32);
+}
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -160,10 +164,17 @@ impl App {
         };
         if let Some(frame) = frame {
             let first = self.texture.is_none();
+            let old_ratio = self.source[0] as f32 / self.source[1] as f32;
             self.source = frame.source;
+            let ratio = self.source[0] as f32 / self.source[1] as f32;
             self.hardware = frame.hardware;
             if let Some(texture) = self.texture.as_mut() {
-                texture.set(frame.image, egui::TextureOptions::LINEAR);
+                if texture.size() == frame.image.size {
+                    // Update existing GPU storage instead of reallocating it at video rate.
+                    texture.set_partial([0, 0], frame.image, egui::TextureOptions::LINEAR);
+                } else {
+                    texture.set(frame.image, egui::TextureOptions::LINEAR);
+                }
             } else {
                 self.texture = Some(ctx.load_texture(
                     "iphone-screen",
@@ -171,19 +182,18 @@ impl App {
                     egui::TextureOptions::LINEAR,
                 ));
             }
-            if first {
+            if first || (!self.fullscreen && (ratio - old_ratio).abs() > 0.01) {
                 self.connecting = false;
-                let height = ctx
-                    .input(|i| {
-                        i.viewport()
-                            .monitor_size
-                            .map(|s| s.y - 100.)
-                            .unwrap_or(760.)
-                    })
-                    .min(820.);
-                ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(Vec2::new(220., 300.)));
+                let monitor = ctx
+                    .input(|i| i.viewport().monitor_size)
+                    .unwrap_or(Vec2::new(1280., 860.));
+                let height = (monitor.y - 100.).min(820.).min((monitor.x - 100.) / ratio);
+                ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(Vec2::new(
+                    220.,
+                    220. / ratio + 32.,
+                )));
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
-                    height * self.source[0] as f32 / self.source[1] as f32,
+                    height * ratio,
                     height + 32.,
                 )));
             }
@@ -259,43 +269,47 @@ impl App {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, video: bool) {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if icon_button(ui, 2, "Close").clicked() {
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-            }
-            if icon_button(ui, 0, "Minimize").clicked() {
-                ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
-            }
-            if video {
-                if icon_button(ui, 1, "Fullscreen (F11)").clicked() {
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 26.),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                if icon_button(ui, 2, "Close").clicked() {
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+                if icon_button(ui, 0, "Minimize").clicked() {
+                    ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+                }
+                if video {
+                    if icon_button(ui, 1, "Fullscreen (F11)").clicked() {
+                        self.fullscreen(ctx);
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.stopping,
+                            egui::Button::new(if self.stopping {
+                                "Stopping…"
+                            } else {
+                                "Disconnect"
+                            })
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        self.disconnect();
+                    }
+                }
+                let drag = ui.allocate_response(
+                    Vec2::new(ui.available_width().max(0.), 26.),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag.drag_started() && !self.fullscreen {
+                    ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                }
+                if video && drag.double_clicked() {
                     self.fullscreen(ctx);
                 }
-                if ui
-                    .add_enabled(
-                        !self.stopping,
-                        egui::Button::new(if self.stopping {
-                            "Stopping…"
-                        } else {
-                            "Disconnect"
-                        })
-                        .frame(false),
-                    )
-                    .clicked()
-                {
-                    self.disconnect();
-                }
-            }
-            let drag = ui.allocate_response(
-                Vec2::new(ui.available_width().max(0.), 26.),
-                egui::Sense::click_and_drag(),
-            );
-            if drag.drag_started() && !self.fullscreen {
-                ctx.send_viewport_cmd(ViewportCommand::StartDrag);
-            }
-            if video && drag.double_clicked() {
-                self.fullscreen(ctx);
-            }
-        });
+            },
+        );
     }
 
     fn resize_edges(&self, ctx: &egui::Context) {
@@ -371,7 +385,17 @@ impl App {
                     ((size.y * pixels).ceil() as u32).div_ceil(32) * 32,
                     Ordering::Relaxed,
                 );
-                let dest = egui::Rect::from_center_size(rect.center(), size);
+                if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+                    self.target_w.store(0, Ordering::Relaxed);
+                    self.target_h.store(0, Ordering::Relaxed);
+                }
+                let dest = if self.fullscreen {
+                    egui::Rect::from_center_size(rect.center(), size)
+                } else {
+                    // WM_SIZING already preserves the video ratio. Fill the complete
+                    // region so fractional DPI rounding cannot leave a one-pixel bar.
+                    rect
+                };
                 ui.painter().image(
                     texture.id(),
                     dest,
@@ -389,8 +413,25 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.update_video(ctx);
+        if let Ok(handle) = frame.window_handle() {
+            if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                let ratio = if self.texture.is_some() && !self.fullscreen {
+                    self.source[0] as f64 / self.source[1] as f64
+                } else {
+                    0.
+                };
+                unsafe {
+                    window_aspect(
+                        handle.hwnd.get() as *mut _,
+                        ratio,
+                        (32. * ctx.pixels_per_point()).round() as i32,
+                        (220. * ctx.pixels_per_point()).round() as i32,
+                    );
+                }
+            }
+        }
         if ctx.input(|i| i.viewport().close_requested()) && self.worker.is_some() {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.close_pending = true;
@@ -495,4 +536,48 @@ fn icon_button(ui: &mut egui::Ui, kind: u8, label: &str) -> egui::Response {
         }
     }
     response.on_hover_text(label)
+}
+
+#[cfg(test)]
+mod sizing_tests {
+    unsafe extern "C" {
+        fn window_constrain_test(
+            coords: *mut i32,
+            edge: u32,
+            ratio: f64,
+            header: i32,
+            minimum: i32,
+        );
+    }
+    #[test]
+    fn all_resize_edges_preserve_phone_ratio_and_anchor() {
+        for edge in 1..=8 {
+            let mut r = [100, 80, 580, 800];
+            unsafe {
+                window_constrain_test(r.as_mut_ptr(), edge, 1184. / 2576., 40, 275);
+            }
+            let w = r[2] - r[0];
+            let h = r[3] - r[1] - 40;
+            assert!((h as f64 - w as f64 / (1184. / 2576.)).abs() <= 0.51);
+            assert!(w >= 275);
+            if [1, 4, 7].contains(&edge) {
+                assert_eq!(r[2], 580);
+            } else {
+                assert_eq!(r[0], 100);
+            }
+            if [3, 4, 5].contains(&edge) {
+                assert_eq!(r[3], 800);
+            } else {
+                assert_eq!(r[1], 80);
+            }
+        }
+    }
+    #[test]
+    fn minimum_width_preserves_ratio() {
+        let mut r = [0, 0, 20, 40];
+        unsafe {
+            window_constrain_test(r.as_mut_ptr(), 8, 0.5, 32, 220);
+        }
+        assert_eq!(r, [0, 0, 220, 472]);
+    }
 }

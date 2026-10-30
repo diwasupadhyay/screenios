@@ -24,7 +24,7 @@ impl Decoder {
     pub fn new(software: bool) -> Result<Self> {
         let p = unsafe { video_create(software as i32) };
         if p.is_null() {
-            bail!("Video decoder could not load. Keep the three FFmpeg DLLs beside ScreenIOS.exe.");
+            bail!("Video decoder could not load. Keep all four FFmpeg DLLs beside ScreenIOS.exe.");
         }
         Ok(Self(p))
     }

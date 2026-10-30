@@ -17,6 +17,13 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("ScreenIOS")
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/screenios.png"
+                )))
+                .expect("Project logo"),
+            )
             .with_inner_size([380., 240.])
             .with_min_inner_size([360., 240.])
             .with_decorations(false)

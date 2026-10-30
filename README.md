@@ -1,13 +1,16 @@
 # ScreenIOS
 
+<img src="screenios.png" width="96" alt="ScreenIOS logo">
+
 Native Windows 11 USB-only iPhone viewer. Rust handles USB and the window; a
 small C++ adapter uses FFmpeg with D3D11 hardware decoding and a software fallback.
 No Python, browser runtime, phone input, or wireless fallback.
 
-Connect an unlocked, trusted iPhone running iOS 27. Click **Connect iPhone**.
+Connect an unlocked, trusted iPhone running iOS 27. Click **Connect**.
 The connection card becomes a borderless floating screen with one slim control
 strip above the video. Drag the empty part of the strip to move it. Resize from
-any edge or corner with normal resize cursors. The strip contains Disconnect,
+any edge or corner with normal resize cursors; the floating window retains the
+phone's aspect ratio without side bars. The strip contains Disconnect,
 Fullscreen, Minimize and Close. Double-click the video or press F11 for
 fullscreen; Escape exits fullscreen. Controls never cover the phone screen.
 

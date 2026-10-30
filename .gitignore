@@ -20,6 +20,7 @@ __pycache__/
 *.hevc
 *.h264
 *.png
+!/screenios.png
 *.jpg
 .env*
 smoke-results.json
