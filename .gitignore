@@ -1,0 +1,25 @@
+# Local binaries, downloaded tools, and private test artifacts. Never publish.
+/target/
+/dist/
+/.local/
+/.venv/
+/research/
+__pycache__/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.zip
+*.7z
+*.log
+*.plist
+*.pem
+*.key
+*.p12
+*.pfx
+*.hevc
+*.h264
+*.png
+*.jpg
+.env*
+smoke-results.json

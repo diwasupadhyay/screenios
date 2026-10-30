@@ -1,0 +1,712 @@
+//! Legacy fetch symbols service client.
+//!
+//! Service: `com.apple.dt.fetchsymbols`
+//! Reference: pymobiledevice3 `dtfetchsymbols.py`
+
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
+
+use indexmap::IndexMap;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use uuid::Uuid;
+
+pub const SERVICE_NAME: &str = "com.apple.dt.fetchsymbols";
+pub const REMOTE_SERVICE_NAME: &str = "com.apple.dt.remoteFetchSymbols";
+const CMD_LIST_FILES: u32 = 0x3030_3030;
+const CMD_GET_FILE: u32 = 1;
+const MAX_CHUNK: usize = 10 * 1024 * 1024;
+const MAX_H2_STREAM_ID: u32 = 0x7fff_ffff;
+/// A dyld shared-cache catalog is small (normally a handful of entries). Keep
+/// a generous protocol ceiling so a malformed count cannot drive an enormous
+/// receive loop while leaving ample room for future device catalogs.
+const MAX_CATALOG_FILES: usize = 65_536;
+
+service_error!(FetchSymbolsError);
+
+pub struct FetchSymbolsClient<S> {
+    stream: S,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> FetchSymbolsClient<S> {
+    pub fn new(stream: S) -> Self {
+        Self { stream }
+    }
+
+    pub async fn list_files(&mut self) -> Result<Vec<String>, FetchSymbolsError> {
+        self.start_command(CMD_LIST_FILES).await?;
+        let response = recv_plist(&mut self.stream).await?;
+        response
+            .get("files")
+            .and_then(plist::Value::as_array)
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|value| value.as_string().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .ok_or_else(|| FetchSymbolsError::Protocol("missing files array".into()))
+    }
+
+    pub async fn download<W: Write>(
+        &mut self,
+        index: u32,
+        mut writer: W,
+        max_bytes: Option<u64>,
+    ) -> Result<u64, FetchSymbolsError> {
+        self.start_command(CMD_GET_FILE).await?;
+        self.stream.write_all(&index.to_be_bytes()).await?;
+        self.stream.flush().await?;
+
+        let size = self.stream.read_u64().await?;
+        let limit = max_bytes.map_or(size, |limit| limit.min(size));
+
+        let mut remaining = limit;
+        let mut written = 0u64;
+        let mut buf = vec![0u8; MAX_CHUNK];
+        while remaining > 0 {
+            let chunk_size = remaining.min(MAX_CHUNK as u64) as usize;
+            self.stream.read_exact(&mut buf[..chunk_size]).await?;
+            writer.write_all(&buf[..chunk_size])?;
+            written += chunk_size as u64;
+            remaining -= chunk_size as u64;
+        }
+
+        Ok(written)
+    }
+
+    async fn start_command(&mut self, command: u32) -> Result<(), FetchSymbolsError> {
+        let encoded = command.to_be_bytes();
+        self.stream.write_all(&encoded).await?;
+        self.stream.flush().await?;
+
+        let mut ack = [0u8; 4];
+        self.stream.read_exact(&mut ack).await?;
+        if ack != encoded {
+            return Err(FetchSymbolsError::Protocol(format!(
+                "unexpected fetchsymbols ack: expected 0x{command:08x}, got 0x{:08x}",
+                u32::from_be_bytes(ack)
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSymbolFile {
+    pub path: String,
+    pub size: u64,
+}
+
+pub struct RemoteFetchSymbolsClient<S> {
+    framer: crate::xpc::h2_raw::H2Framer<S>,
+    next_msg_id: u64,
+    control_messages: crate::xpc::message::XpcMessageBuffer,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> RemoteFetchSymbolsClient<S> {
+    pub async fn connect(stream: S) -> Result<Self, FetchSymbolsError> {
+        let mut framer = crate::xpc::h2_raw::H2Framer::connect(stream)
+            .await
+            .map_err(|err| FetchSymbolsError::Protocol(format!("H2 error: {err}")))?;
+        bootstrap_remote_xpc(&mut framer).await?;
+        Ok(Self {
+            framer,
+            next_msg_id: 1,
+            control_messages: crate::xpc::message::XpcMessageBuffer::new(),
+        })
+    }
+
+    pub async fn list_files(&mut self) -> Result<Vec<RemoteSymbolFile>, FetchSymbolsError> {
+        self.send_catalog_request().await?;
+
+        let count = self.recv_catalog_count().await?;
+        let mut files = Vec::with_capacity(count.min(128));
+        for _ in 0..count {
+            files.push(self.recv_catalog_entry().await?);
+        }
+        Ok(files)
+    }
+
+    pub async fn download<W: Write>(
+        &mut self,
+        index: u32,
+        mut writer: W,
+        max_bytes: Option<u64>,
+    ) -> Result<u64, FetchSymbolsError> {
+        let files = self.list_files().await?;
+        let file = files.get(index as usize).ok_or_else(|| {
+            FetchSymbolsError::Protocol(format!("symbol index {index} out of range"))
+        })?;
+        self.download_known(index, file, &mut writer, max_bytes)
+            .await
+    }
+
+    pub async fn download_known<W: Write>(
+        &mut self,
+        index: u32,
+        file: &RemoteSymbolFile,
+        mut writer: W,
+        max_bytes: Option<u64>,
+    ) -> Result<u64, FetchSymbolsError> {
+        let stream_id = file_stream_id(index)?;
+        self.framer
+            .write_stream(
+                stream_id,
+                &crate::xpc::message::encode_message(&crate::xpc::XpcMessage {
+                    flags: crate::xpc::message::flags::ALWAYS_SET
+                        | crate::xpc::message::flags::FILE_TX_STREAM_RESPONSE,
+                    msg_id: 0,
+                    body: None,
+                })
+                .map_err(|err| {
+                    FetchSymbolsError::Protocol(format!("file stream encode failed: {err}"))
+                })?,
+            )
+            .await
+            .map_err(|err| {
+                FetchSymbolsError::Protocol(format!("file stream open failed: {err}"))
+            })?;
+
+        let limit = max_bytes.map_or(file.size, |limit| limit.min(file.size));
+        let mut remaining = limit;
+        let mut written = 0u64;
+        let requested_buf_len = usize::try_from(limit.max(1)).unwrap_or(MAX_CHUNK);
+        let mut buf = vec![0u8; MAX_CHUNK.min(requested_buf_len)];
+
+        while remaining > 0 {
+            let chunk_len = remaining.min(buf.len() as u64) as usize;
+            let chunk = self
+                .framer
+                .read_stream(stream_id, chunk_len)
+                .await
+                .map_err(|err| {
+                    FetchSymbolsError::Protocol(format!("file stream read failed: {err}"))
+                })?;
+            buf[..chunk_len].copy_from_slice(&chunk);
+            writer.write_all(&buf[..chunk_len])?;
+            written += chunk_len as u64;
+            remaining -= chunk_len as u64;
+        }
+
+        Ok(written)
+    }
+
+    async fn send_catalog_request(&mut self) -> Result<(), FetchSymbolsError> {
+        let mut request = IndexMap::new();
+        request.insert(
+            "XPCDictionary_sideChannel".to_string(),
+            crate::xpc::XpcValue::Uuid(*Uuid::new_v4().as_bytes()),
+        );
+        request.insert(
+            "DSCFilePaths".to_string(),
+            crate::xpc::XpcValue::Array(Vec::new()),
+        );
+
+        self.framer
+            .write_client_server(
+                &crate::xpc::message::encode_message(&crate::xpc::XpcMessage {
+                    flags: crate::xpc::message::flags::ALWAYS_SET
+                        | crate::xpc::message::flags::DATA_PRESENT
+                        | crate::xpc::message::flags::WANTING_REPLY,
+                    msg_id: self.next_msg_id,
+                    body: Some(crate::xpc::XpcValue::Dictionary(request)),
+                })
+                .map_err(|err| {
+                    FetchSymbolsError::Protocol(format!("catalog request encode failed: {err}"))
+                })?,
+            )
+            .await
+            .map_err(|err| FetchSymbolsError::Protocol(format!("catalog request failed: {err}")))?;
+        self.next_msg_id += 1;
+        Ok(())
+    }
+
+    async fn recv_control_message(&mut self) -> Result<crate::xpc::XpcMessage, FetchSymbolsError> {
+        loop {
+            if let Some(message) = self.try_take_pending_control_message()? {
+                if message.flags & crate::xpc::message::flags::FILE_TX_STREAM_REQUEST != 0 {
+                    continue;
+                }
+                return Ok(message);
+            }
+
+            let frame = self.framer.read_next_data_frame().await.map_err(|err| {
+                FetchSymbolsError::Protocol(format!("control frame read failed: {err}"))
+            })?;
+            if frame.is_end_stream() && frame.payload.is_empty() {
+                continue;
+            }
+            if !frame.is_remote_xpc_control_stream() {
+                continue;
+            }
+            self.control_messages.push(&frame.payload).map_err(|err| {
+                FetchSymbolsError::Protocol(format!("control response buffer failed: {err}"))
+            })?;
+        }
+    }
+
+    async fn recv_catalog_count(&mut self) -> Result<usize, FetchSymbolsError> {
+        let mut last_error = None;
+        for _ in 0..32 {
+            let message = self.recv_control_message().await?;
+            match try_parse_catalog_count(&message) {
+                Some(Ok(count)) => return Ok(count),
+                Some(Err(err)) => last_error = Some(err),
+                None => continue,
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            FetchSymbolsError::Protocol("did not receive remote symbols catalog count".into())
+        }))
+    }
+
+    async fn recv_catalog_entry(&mut self) -> Result<RemoteSymbolFile, FetchSymbolsError> {
+        let mut last_error = None;
+        for _ in 0..64 {
+            let message = self.recv_control_message().await?;
+            match try_parse_catalog_entry(&message) {
+                Some(Ok(entry)) => return Ok(entry),
+                Some(Err(err)) => {
+                    tracing::trace!(
+                        "remote fetchsymbols catalog entry parse failed: err={err}; body={:?}",
+                        message.body
+                    );
+                    last_error = Some(err);
+                }
+                None => continue,
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            FetchSymbolsError::Protocol("did not receive remote symbols catalog entry".into())
+        }))
+    }
+}
+
+fn file_stream_id(index: u32) -> Result<u32, FetchSymbolsError> {
+    let stream_id = index
+        .checked_add(1)
+        .and_then(|index| index.checked_mul(2))
+        .ok_or_else(|| {
+            FetchSymbolsError::Protocol(format!(
+                "symbol index {index} overflows the file-transfer stream ID"
+            ))
+        })?;
+    if stream_id == 0 || stream_id > MAX_H2_STREAM_ID {
+        return Err(FetchSymbolsError::Protocol(format!(
+            "symbol index {index} cannot be represented as an HTTP/2 stream ID"
+        )));
+    }
+    Ok(stream_id)
+}
+
+impl<S> RemoteFetchSymbolsClient<S> {
+    fn try_take_pending_control_message(
+        &mut self,
+    ) -> Result<Option<crate::xpc::XpcMessage>, FetchSymbolsError> {
+        self.control_messages
+            .try_next()
+            .map_err(|err| FetchSymbolsError::Protocol(format!("control decode failed: {err}")))
+    }
+}
+
+async fn recv_plist<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<plist::Dictionary, FetchSymbolsError> {
+    let len = stream.read_u32().await? as usize;
+    const MAX_PLIST_SIZE: usize = 8 * 1024 * 1024;
+    if len > MAX_PLIST_SIZE {
+        return Err(FetchSymbolsError::Protocol(format!(
+            "plist length {len} exceeds max {MAX_PLIST_SIZE}"
+        )));
+    }
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;
+    Ok(plist::from_bytes(&buf)?)
+}
+
+fn try_parse_catalog_count(
+    message: &crate::xpc::XpcMessage,
+) -> Option<Result<usize, FetchSymbolsError>> {
+    let dict = message.body.as_ref()?.as_dict()?;
+    let value = dict.get("DSCFilePaths")?;
+    Some(parse_catalog_count(value))
+}
+
+fn parse_catalog_count(value: &crate::xpc::XpcValue) -> Result<usize, FetchSymbolsError> {
+    let declared = as_u64(value).ok_or_else(|| {
+        FetchSymbolsError::Protocol("catalog response missing DSCFilePaths count".into())
+    })?;
+    let count = usize::try_from(declared).map_err(|_| {
+        FetchSymbolsError::Protocol(format!("catalog file count {declared} exceeds usize::MAX"))
+    })?;
+    if count > MAX_CATALOG_FILES {
+        return Err(FetchSymbolsError::Protocol(format!(
+            "catalog file count {declared} exceeds limit {MAX_CATALOG_FILES}"
+        )));
+    }
+    Ok(count)
+}
+
+fn try_parse_catalog_entry(
+    message: &crate::xpc::XpcMessage,
+) -> Option<Result<RemoteSymbolFile, FetchSymbolsError>> {
+    let dict = message.body.as_ref()?.as_dict()?;
+    let entry = dict.get("DSCFilePaths")?.as_dict()?;
+    let path = entry
+        .get("filePath")
+        .and_then(crate::xpc::XpcValue::as_str)
+        .ok_or_else(|| FetchSymbolsError::Protocol("catalog entry missing filePath".into()));
+    let transfer = entry
+        .get("fileTransfer")
+        .ok_or_else(|| FetchSymbolsError::Protocol("catalog entry missing fileTransfer".into()));
+
+    Some((|| {
+        let path = path?.to_string();
+        let size = parse_transfer_size(transfer?)?;
+
+        Ok(RemoteSymbolFile { path, size })
+    })())
+}
+
+fn parse_transfer_size(value: &crate::xpc::XpcValue) -> Result<u64, FetchSymbolsError> {
+    if let Some((_, transfer)) = value.as_file_transfer() {
+        return transfer
+            .as_dict()
+            .and_then(|dict| dict.get("s"))
+            .and_then(as_u64)
+            .ok_or_else(|| {
+                FetchSymbolsError::Protocol("catalog entry missing fileTransfer size".into())
+            });
+    }
+
+    let dict = value.as_dict().ok_or_else(|| {
+        FetchSymbolsError::Protocol("catalog entry fileTransfer has unsupported shape".into())
+    })?;
+    if let Some(size) = dict.get("expectedLength").and_then(as_u64) {
+        return Ok(size);
+    }
+    dict.get("xpcFileTransfer")
+        .ok_or_else(|| FetchSymbolsError::Protocol("catalog entry missing xpcFileTransfer".into()))
+        .and_then(parse_transfer_size)
+}
+
+fn as_u64(value: &crate::xpc::XpcValue) -> Option<u64> {
+    match value {
+        crate::xpc::XpcValue::Uint64(n) => Some(*n),
+        crate::xpc::XpcValue::Int64(n) if *n >= 0 => Some(*n as u64),
+        _ => None,
+    }
+}
+
+pub fn remote_symbol_output_path(root: &Path, remote_path: &str) -> PathBuf {
+    let relative = sanitize_remote_symbol_path(remote_path);
+    root.join(relative)
+}
+
+fn sanitize_remote_symbol_path(remote_path: &str) -> PathBuf {
+    let normalized = remote_path.replace('\\', "/");
+    let mut out = PathBuf::new();
+    for component in Path::new(&normalized).components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir
+            | Component::Prefix(_) => {}
+        }
+    }
+    out
+}
+
+async fn bootstrap_remote_xpc<S>(
+    framer: &mut crate::xpc::h2_raw::H2Framer<S>,
+) -> Result<(), FetchSymbolsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    framer
+        .write_client_server(
+            &crate::xpc::message::encode_message(&crate::xpc::XpcMessage {
+                flags: crate::xpc::message::flags::ALWAYS_SET,
+                msg_id: 0,
+                body: Some(crate::xpc::XpcValue::Dictionary(IndexMap::new())),
+            })
+            .map_err(|err| {
+                FetchSymbolsError::Protocol(format!(
+                    "remote XPC bootstrap encode step 1 failed: {err}"
+                ))
+            })?,
+        )
+        .await
+        .map_err(|err| {
+            FetchSymbolsError::Protocol(format!("remote XPC bootstrap step 1 failed: {err}"))
+        })?;
+
+    framer
+        .open_stream(crate::xpc::h2_raw::STREAM_SERVER_CLIENT)
+        .await
+        .map_err(|err| {
+            FetchSymbolsError::Protocol(format!("remote XPC bootstrap open stream 3 failed: {err}"))
+        })?;
+
+    framer
+        .write_client_server(
+            &crate::xpc::message::encode_message(&crate::xpc::XpcMessage {
+                flags: crate::xpc::message::flags::ALWAYS_SET | 0x200,
+                msg_id: 0,
+                body: None,
+            })
+            .map_err(|err| {
+                FetchSymbolsError::Protocol(format!(
+                    "remote XPC bootstrap encode step 2 failed: {err}"
+                ))
+            })?,
+        )
+        .await
+        .map_err(|err| {
+            FetchSymbolsError::Protocol(format!("remote XPC bootstrap step 2 failed: {err}"))
+        })?;
+
+    framer
+        .write_server_client(
+            &crate::xpc::message::encode_message(&crate::xpc::XpcMessage {
+                flags: crate::xpc::message::flags::ALWAYS_SET
+                    | crate::xpc::message::flags::INIT_HANDSHAKE,
+                msg_id: 0,
+                body: None,
+            })
+            .map_err(|err| {
+                FetchSymbolsError::Protocol(format!(
+                    "remote XPC bootstrap encode step 3 failed: {err}"
+                ))
+            })?,
+        )
+        .await
+        .map_err(|err| {
+            FetchSymbolsError::Protocol(format!("remote XPC bootstrap step 3 failed: {err}"))
+        })?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    #[test]
+    fn file_stream_id_rejects_overflow_and_reserved_ids() {
+        assert_eq!(file_stream_id(0).unwrap(), 2);
+        assert_eq!(file_stream_id(0x3fff_fffe).unwrap(), 0x7fff_fffe);
+        assert!(file_stream_id(0x3fff_ffff).is_err());
+        assert!(file_stream_id(u32::MAX).is_err());
+    }
+
+    fn catalog_count_message(value: crate::xpc::XpcValue) -> crate::xpc::XpcMessage {
+        crate::xpc::XpcMessage {
+            flags: crate::xpc::message::flags::ALWAYS_SET,
+            msg_id: 1,
+            body: Some(crate::xpc::XpcValue::Dictionary(IndexMap::from([(
+                "DSCFilePaths".to_string(),
+                value,
+            )]))),
+        }
+    }
+
+    #[test]
+    fn catalog_count_is_checked_before_catalog_loop() {
+        let normal =
+            try_parse_catalog_count(&catalog_count_message(crate::xpc::XpcValue::Uint64(2)))
+                .expect("count field")
+                .expect("valid count");
+        assert_eq!(normal, 2);
+
+        let over = MAX_CATALOG_FILES as u64 + 1;
+        let error =
+            try_parse_catalog_count(&catalog_count_message(crate::xpc::XpcValue::Uint64(over)))
+                .expect("count field")
+                .expect_err("over-limit count must be rejected");
+        assert!(error.to_string().contains(&over.to_string()), "{error}");
+
+        let error = try_parse_catalog_count(&catalog_count_message(crate::xpc::XpcValue::Uint64(
+            u64::MAX,
+        )))
+        .expect("count field")
+        .expect_err("u64::MAX must be rejected");
+        assert!(error.to_string().contains("count"), "{error}");
+    }
+
+    #[test]
+    fn remote_symbol_output_path_trims_root_prefix_and_rejects_traversal() {
+        // Compare `Path`s rather than strings: the separator differs per host.
+        let root = Path::new("/tmp/Symbols");
+        assert_eq!(
+            remote_symbol_output_path(root, "/System/Library/Foo"),
+            root.join("System").join("Library").join("Foo")
+        );
+        assert_eq!(
+            remote_symbol_output_path(root, "/System/../Library/Foo"),
+            root.join("System").join("Library").join("Foo")
+        );
+        assert_eq!(
+            remote_symbol_output_path(root, "../private/var"),
+            root.join("private").join("var")
+        );
+    }
+
+    fn h2_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let length = payload.len();
+        let mut frame = Vec::with_capacity(9 + length);
+        frame.extend_from_slice(&[
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+            frame_type,
+            flags,
+        ]);
+        frame.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    async fn read_h2_frame(stream: &mut tokio::io::DuplexStream) -> (u8, u32, Vec<u8>) {
+        let mut header = [0u8; 9];
+        stream.read_exact(&mut header).await.unwrap();
+        let length =
+            ((header[0] as usize) << 16) | ((header[1] as usize) << 8) | header[2] as usize;
+        let mut payload = vec![0u8; length];
+        stream.read_exact(&mut payload).await.unwrap();
+        (
+            header[3],
+            u32::from_be_bytes([header[5] & 0x7f, header[6], header[7], header[8]]),
+            payload,
+        )
+    }
+
+    fn catalog_message(body: crate::xpc::XpcValue, msg_id: u64) -> Vec<u8> {
+        crate::xpc::message::encode_message(&crate::xpc::XpcMessage {
+            flags: crate::xpc::message::flags::ALWAYS_SET,
+            msg_id,
+            body: Some(body),
+        })
+        .unwrap()
+        .to_vec()
+    }
+
+    fn catalog_entry(path: &str, size: u64) -> crate::xpc::XpcValue {
+        crate::xpc::XpcValue::Dictionary(IndexMap::from([(
+            "DSCFilePaths".into(),
+            crate::xpc::XpcValue::Dictionary(IndexMap::from([
+                ("filePath".into(), crate::xpc::XpcValue::String(path.into())),
+                (
+                    "fileTransfer".into(),
+                    crate::xpc::XpcValue::Dictionary(IndexMap::from([(
+                        "expectedLength".into(),
+                        crate::xpc::XpcValue::Uint64(size),
+                    )])),
+                ),
+            ])),
+        )]))
+    }
+
+    fn side_channel_preamble(msg_id: u64) -> Vec<u8> {
+        crate::xpc::message::encode_message(&crate::xpc::XpcMessage {
+            flags: crate::xpc::message::flags::ALWAYS_SET
+                | crate::xpc::message::flags::FILE_TX_STREAM_REQUEST,
+            msg_id,
+            body: None,
+        })
+        .unwrap()
+        .to_vec()
+    }
+
+    #[tokio::test]
+    async fn remote_list_reads_multiple_catalog_entries_while_side_channels_are_open() {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let mut preface = vec![0u8; crate::xpc::h2_raw::H2_PREFACE.len()];
+            server.read_exact(&mut preface).await.unwrap();
+            assert_eq!(preface, crate::xpc::h2_raw::H2_PREFACE);
+            let _ = read_h2_frame(&mut server).await; // client SETTINGS
+            let _ = read_h2_frame(&mut server).await; // connection WINDOW_UPDATE
+            server.write_all(&h2_frame(0x04, 0, 0, &[])).await.unwrap();
+
+            // SETTINGS ACK, then bootstrap: HEADERS#1, DATA#1, HEADERS#3,
+            // DATA#1, DATA#3.
+            for _ in 0..6 {
+                let _ = read_h2_frame(&mut server).await;
+            }
+
+            let count = catalog_message(
+                crate::xpc::XpcValue::Dictionary(IndexMap::from([(
+                    "DSCFilePaths".into(),
+                    crate::xpc::XpcValue::Uint64(3),
+                )])),
+                1,
+            );
+            server
+                .write_all(&h2_frame(0x01, 0x04, 2, &[]))
+                .await
+                .unwrap();
+            server
+                .write_all(&h2_frame(0x00, 0, 1, &count))
+                .await
+                .unwrap();
+
+            for (index, (path, size)) in [
+                ("/System/Library/Cache0", 10),
+                ("/System/Library/Cache1", 11),
+                ("/System/Library/Cache2", 12),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let stream_id = 2 * (index as u32 + 1);
+                let entry = catalog_message(catalog_entry(path, size), index as u64 + 2);
+                server
+                    .write_all(&h2_frame(
+                        0x00,
+                        0,
+                        stream_id,
+                        &side_channel_preamble(index as u64 + 1),
+                    ))
+                    .await
+                    .unwrap();
+                if index + 1 < 3 {
+                    server
+                        .write_all(&h2_frame(0x01, 0x04, stream_id + 2, &[]))
+                        .await
+                        .unwrap();
+                }
+                server
+                    .write_all(&h2_frame(0x00, 0, 1, &entry))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut client = RemoteFetchSymbolsClient::connect(client).await.unwrap();
+        let files = client.list_files().await.unwrap();
+        assert_eq!(
+            files,
+            vec![
+                RemoteSymbolFile {
+                    path: "/System/Library/Cache0".into(),
+                    size: 10,
+                },
+                RemoteSymbolFile {
+                    path: "/System/Library/Cache1".into(),
+                    size: 11,
+                },
+                RemoteSymbolFile {
+                    path: "/System/Library/Cache2".into(),
+                    size: 12,
+                },
+            ]
+        );
+        server_task.await.unwrap();
+    }
+}
