@@ -1,6 +1,15 @@
 use anyhow::{bail, Context, Result};
-use ios_core::display::{DisplayServiceClient, MediaKind, MediaStreamOptions, RtpAssembler, RtpPacket};
-use std::{net::Ipv6Addr, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
+use ios_core::display::{
+    DisplayServiceClient, MediaKind, MediaStreamOptions, RtpAssembler, RtpPacket,
+};
+use std::{
+    net::Ipv6Addr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 const MEDIA_PORT: u16 = 55000;
 
@@ -10,7 +19,8 @@ fn udp_packet(source: Ipv6Addr, dest: Ipv6Addr, port: u16, payload: &[u8]) -> Ve
     let mut p = vec![0u8; 40 + len];
     p[0] = 0x60;
     p[4..6].copy_from_slice(&(len as u16).to_be_bytes());
-    p[6] = 17; p[7] = 64;
+    p[6] = 17;
+    p[7] = 64;
     p[8..24].copy_from_slice(&source.octets());
     p[24..40].copy_from_slice(&dest.octets());
     p[40..42].copy_from_slice(&MEDIA_PORT.to_be_bytes());
@@ -21,32 +31,57 @@ fn udp_packet(source: Ipv6Addr, dest: Ipv6Addr, port: u16, payload: &[u8]) -> Ve
     for chunk in p[8..40].chunks(2).chain(p[40..].chunks(2)) {
         sum += (u32::from(chunk[0]) << 8) | u32::from(*chunk.get(1).unwrap_or(&0));
     }
-    while sum >> 16 != 0 { sum = (sum & 65535) + (sum >> 16); }
+    while sum >> 16 != 0 {
+        sum = (sum & 65535) + (sum >> 16);
+    }
     let checksum = !(sum as u16);
-    p[46..48].copy_from_slice(&if checksum == 0 {65535} else {checksum}.to_be_bytes());
+    p[46..48].copy_from_slice(&if checksum == 0 { 65535 } else { checksum }.to_be_bytes());
     p
 }
 
-pub async fn capture(stop: Arc<AtomicBool>, mut consume: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+pub async fn capture(
+    stop: Arc<AtomicBool>,
+    mut consume: impl FnMut(&[u8]) -> Result<bool>,
+) -> Result<()> {
     // This is the Apple service on this PC, never a remote usbmux endpoint.
     std::env::set_var("USBMUXD_SOCKET_ADDRESS", "127.0.0.1:27015");
     let devices = ios_core::list_devices().await?;
-    let usb: Vec<_> = devices.into_iter().filter(|d| d.connection_type == "USB").collect();
-    if usb.len() != 1 { bail!("Connect one unlocked iPhone by USB and tap Trust."); }
-    let device = tokio::time::timeout(Duration::from_secs(25),
-        ios_core::connect(&usb[0].udid, ios_core::ConnectOptions::default())).await??;
+    let usb: Vec<_> = devices
+        .into_iter()
+        .filter(|d| d.connection_type == "USB")
+        .collect();
+    if usb.len() != 1 {
+        bail!("Connect one unlocked iPhone by USB and tap Trust.");
+    }
+    let device = tokio::time::timeout(
+        Duration::from_secs(25),
+        ios_core::connect(&usb[0].udid, ios_core::ConnectOptions::default()),
+    )
+    .await??;
     let tunnel = device.tunnel_handle().context("USB tunnel unavailable")?;
-    let (mut packets, outbound) = tunnel.media_channels().context("USB media channel unavailable")?;
-    let source: Ipv6Addr = device.client_address().context("Missing host endpoint")?.parse()?;
-    let dest: Ipv6Addr = device.server_address().context("Missing device endpoint")?.parse()?;
-    let (xpc, metadata) = device.connect_xpc_service_with_metadata(ios_core::display::SERVICE_NAME).await?;
+    let (mut packets, outbound) = tunnel
+        .media_channels()
+        .context("USB media channel unavailable")?;
+    let source: Ipv6Addr = device
+        .client_address()
+        .context("Missing host endpoint")?
+        .parse()?;
+    let dest: Ipv6Addr = device
+        .server_address()
+        .context("Missing device endpoint")?
+        .parse()?;
+    let (xpc, metadata) = device
+        .connect_xpc_service_with_metadata(ios_core::display::SERVICE_NAME)
+        .await?;
     let mut display = DisplayServiceClient::from_resolved_metadata(xpc, &metadata)?;
     let options = MediaStreamOptions {
-        receiver_ip: source.to_string(), sender_ip: dest.to_string(), receiver_port: MEDIA_PORT,
+        receiver_ip: source.to_string(),
+        sender_ip: dest.to_string(),
+        receiver_port: MEDIA_PORT,
         ..Default::default()
     };
     let stream = display.start_video_stream(&options).await?;
-    let mut assembler = RtpAssembler::new(MediaKind::Video, 8*1024*1024, 4096);
+    let mut assembler = RtpAssembler::new(MediaKind::Video, 8 * 1024 * 1024, 4096);
     let mut feedback = tokio::time::interval(Duration::from_secs(1));
     let mut highest: u32 = 0;
     let mut seen = false;
@@ -90,7 +125,7 @@ pub async fn capture(stop: Arc<AtomicBool>, mut consume: impl FnMut(&[u8]) -> Re
                         let key = is_key(&unit.data);
                         if need_key && !key { continue; }
                         if key { need_key = false; }
-                        consume(&unit.data)?;
+                        if !consume(&unit.data)? { need_key = true; }
                         last_unit = Instant::now();
                     }
                 }
@@ -99,17 +134,23 @@ pub async fn capture(stop: Arc<AtomicBool>, mut consume: impl FnMut(&[u8]) -> Re
         Ok(())
     }.await;
     let cleanup = tokio::time::timeout(Duration::from_secs(5), async {
-        let (xpc, metadata) = device.connect_xpc_service_with_metadata(ios_core::display::SERVICE_NAME).await?;
+        let (xpc, metadata) = device
+            .connect_xpc_service_with_metadata(ios_core::display::SERVICE_NAME)
+            .await?;
         let mut control = DisplayServiceClient::from_resolved_metadata(xpc, &metadata)?;
         control.stop_media_stream(stream.client_session_id).await?;
         Ok::<_, anyhow::Error>(())
-    }).await;
-    if result.is_ok() { cleanup??; }
+    })
+    .await;
+    if result.is_ok() {
+        cleanup??;
+    }
     result
 }
 
 pub fn is_key(data: &[u8]) -> bool {
-    data.windows(5).any(|w| w[..4] == [0,0,0,1] && (16..=21).contains(&((w[4]>>1)&63)))
+    data.windows(5)
+        .any(|w| w[..4] == [0, 0, 0, 1] && (16..=21).contains(&((w[4] >> 1) & 63)))
 }
 
 #[cfg(test)]
@@ -117,12 +158,17 @@ mod tests {
     use super::*;
     #[test]
     fn udp_checksum_and_addresses() {
-        let a = "fd00::1".parse().unwrap(); let b = "fd00::2".parse().unwrap();
-        let p = udp_packet(a,b,1234,&[1,2,3]);
+        let a = "fd00::1".parse().unwrap();
+        let b = "fd00::2".parse().unwrap();
+        let p = udp_packet(a, b, 1234, &[1, 2, 3]);
         assert_eq!(&p[8..24], &a.octets());
         let mut sum = 11u32 + 17;
-        for c in p[8..].chunks(2) { sum += ((c[0] as u32)<<8) | *c.get(1).unwrap_or(&0) as u32; }
-        while sum >> 16 != 0 { sum = (sum&65535) + (sum>>16); }
-        assert_eq!(sum,65535);
+        for c in p[8..].chunks(2) {
+            sum += ((c[0] as u32) << 8) | *c.get(1).unwrap_or(&0) as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 65535) + (sum >> 16);
+        }
+        assert_eq!(sum, 65535);
     }
 }

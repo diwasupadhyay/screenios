@@ -1,19 +1,22 @@
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-$sdk = Join-Path $PSScriptRoot '.local/ffmpeg/ffmpeg-master-latest-win64-lgpl-shared'
+$sdk = Join-Path $PSScriptRoot '.local/ffmpeg/ffmpeg-N-128142-g28fda48e0b-win64-lgpl-shared'
 if (-not (Test-Path (Join-Path $sdk 'include/libavcodec/avcodec.h'))) {
     New-Item -ItemType Directory -Force .local | Out-Null
-    $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip'
+    $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-28-19-47/ffmpeg-N-128142-g28fda48e0b-win64-lgpl-shared.zip'
     Invoke-WebRequest $url -OutFile .local/ffmpeg.zip
     $actual = (Get-FileHash .local/ffmpeg.zip -Algorithm SHA256).Hash
-    if ($actual -ne 'C76D748F241055AA34010741F098886BBB82506DBC76D52C1B62232B1C428593') {
+    if ($actual -ne 'CDC8388862F20BB0393141F944FE18B54E7A6DE50FD42A24DB58C63FB48C6A8C') {
         throw 'Upstream decoder SDK changed. Review its ABI and update the pinned hash before building, or supply the documented SDK manually.'
     }
     Expand-Archive .local/ffmpeg.zip .local/ffmpeg -Force
 }
+$ErrorActionPreference = 'Continue'
 cargo build --release
-if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
-$decoder = Join-Path $PSScriptRoot '.local/ffmpeg/ffmpeg-master-latest-win64-lgpl-shared/bin'
+$buildExit = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+if ($buildExit -ne 0) { throw 'Native build failed' }
+$decoder = Join-Path $PSScriptRoot '.local/ffmpeg/ffmpeg-N-128142-g28fda48e0b-win64-lgpl-shared/bin'
 foreach ($dll in @('avcodec-63.dll','avutil-61.dll','swscale-10.dll','swresample-7.dll')) {
     Copy-Item (Join-Path $decoder $dll) (Join-Path $PSScriptRoot 'target/release') -Force
 }

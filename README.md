@@ -5,9 +5,11 @@ small C++ adapter uses FFmpeg with D3D11 hardware decoding and a software fallba
 No Python, browser runtime, phone input, or wireless fallback.
 
 Connect an unlocked, trusted iPhone running iOS 27. Click **Connect iPhone**.
-The connection card becomes a floating screen. Drag to move, resize from the
-bottom-right corner, double-click or press F11 for fullscreen. Right-click for
-Disconnect and Always on top. Escape exits fullscreen.
+The connection card becomes a borderless floating screen with one slim control
+strip above the video. Drag the empty part of the strip to move it. Resize from
+any edge or corner with normal resize cursors. The strip contains Disconnect,
+Fullscreen, Minimize and Close. Double-click the video or press F11 for
+fullscreen; Escape exits fullscreen. Controls never cover the phone screen.
 
 Requires Apple's USB driver (Apple Devices/iTunes), Developer Mode and an
 available CoreDevice display service. No apps or developer images are installed
