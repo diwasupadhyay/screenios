@@ -14,9 +14,26 @@ phone's aspect ratio without side bars. The strip contains Disconnect,
 Fullscreen, Minimize and Close. Double-click the video or press F11 for
 fullscreen; Escape exits fullscreen. Controls never cover the phone screen.
 
-Requires Apple's USB driver (Apple Devices/iTunes), Developer Mode and an
-available CoreDevice display service. No apps or developer images are installed
-automatically. Protected content may not be captured by iOS.
+The startup screen offers two USB modes:
+- **Developer Mode**: the tested CoreDevice path. Requires Apple's USB driver
+  (Apple Devices/iTunes), Trust, Developer Mode, and an available display service.
+- **Without Developer Mode**: experimental QuickTime USB capture through a
+  separate native helper. Use **Install USB driver** to install the bundled,
+  hash-verified UsbDk driver with Windows administrator approval. The installer
+  works offline. Developer Mode-off streaming has not yet been
+  verified on the attached iOS 27 device. There is no silent fallback between modes.
+
+Current non-developer test result: UsbDk installs and opens the capture interface,
+but this PC/iPhone combination returns `LIBUSB_ERROR_IO` on bulk transfers,
+including the handshake retry. This mode is experimental, not a verified
+alternative to the working Developer Mode path.
+
+Follow the mode-specific setup instructions in the app. iOS displays its own
+Trust, passcode, restart and Developer Mode confirmations on the phone.
+Driver installation only happens when explicitly requested. ScreenIOS does not
+install phone apps or developer images. Apple's USB driver is still required
+for Developer Mode; install Apple Devices if it is missing.
+Protected content may not be captured by iOS.
 
 ## Build
 
@@ -25,7 +42,7 @@ Install Rust for Windows MSVC and Visual Studio C++ Build Tools. Run
 The script downloads the native decoder SDK on first build. Internet is needed
 for build dependencies only; mirroring uses USB exclusively.
 
-Run `dist/ScreenIOS/ScreenIOS.exe`. Keep its DLLs beside it.
+Run `dist/ScreenIOS/ScreenIOS.exe`. Keep its DLLs and USB helper beside it.
 Executables, DLLs, downloaded SDKs, logs and device data are excluded from Git.
 
 `cargo test --bin screenios` runs protocol tests. `ScreenIOS.exe --smoke` runs

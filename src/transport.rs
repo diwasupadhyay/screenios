@@ -13,6 +13,23 @@ use std::{
 
 const MEDIA_PORT: u16 = 55000;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Developer,
+    QuickTime,
+}
+
+pub async fn capture_mode(
+    stop: Arc<AtomicBool>,
+    mode: Mode,
+    consume: impl FnMut(&[u8]) -> Result<bool>,
+) -> Result<()> {
+    match mode {
+        Mode::Developer => capture(stop, consume).await,
+        Mode::QuickTime => crate::quicktime::capture(stop, consume).await,
+    }
+}
+
 /// IPv6/UDP packet for RTCP feedback carried inside the USB CoreDevice tunnel.
 fn udp_packet(source: Ipv6Addr, dest: Ipv6Addr, port: u16, payload: &[u8]) -> Vec<u8> {
     let len = payload.len() + 8;
@@ -45,7 +62,7 @@ pub async fn capture(
 ) -> Result<()> {
     // This is the Apple service on this PC, never a remote usbmux endpoint.
     std::env::set_var("USBMUXD_SOCKET_ADDRESS", "127.0.0.1:27015");
-    let devices = ios_core::list_devices().await?;
+    let devices = ios_core::list_devices().await.context("Apple USB service is unavailable. Install Apple Devices for Windows and reconnect the iPhone.")?;
     let usb: Vec<_> = devices
         .into_iter()
         .filter(|d| d.connection_type == "USB")
@@ -53,11 +70,26 @@ pub async fn capture(
     if usb.len() != 1 {
         bail!("Connect one unlocked iPhone by USB and tap Trust.");
     }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let pair=ios_core::PairRecord::load(&usb[0].udid)
+            .map_err(|_| anyhow::anyhow!("Trust is not set up. Unlock your iPhone, open Apple Devices on this PC, and tap Trust on the phone. Enter the passcode on the phone, then retry."))?;
+        let mux=ios_core::MuxClient::connect().await?;
+        let stream=mux.connect_to_port(usb[0].device_id,ios_core::LOCKDOWN_PORT).await?;
+        let mut lockdown=ios_core::LockdownClient::connect_with_stream(stream,&pair).await
+            .context("Unlock your iPhone and accept Trust on the phone, then reconnect.")?;
+        if let Ok(value)=lockdown.get_value(Some("com.apple.security.mac.amfi"),Some("DeveloperModeStatus")).await {
+            if value.as_boolean()==Some(false) {
+                bail!("Developer Mode is off. On your iPhone open Settings > Privacy & Security > Developer Mode, enable it, restart, unlock, and confirm Turn On. Then click Connect again.");
+            }
+        }
+        Ok::<_,anyhow::Error>(())
+    }).await.context("The iPhone did not respond. Unlock it and check for a Trust prompt.")??;
     let device = tokio::time::timeout(
         Duration::from_secs(25),
         ios_core::connect(&usb[0].udid, ios_core::ConnectOptions::default()),
     )
-    .await??;
+    .await.context("Connection timed out. Unlock your iPhone and confirm Developer Mode is enabled.")?
+    .context("Could not open the developer USB connection. Check Trust and Developer Mode, then reconnect.")?;
     let tunnel = device.tunnel_handle().context("USB tunnel unavailable")?;
     let (mut packets, outbound) = tunnel
         .media_channels()

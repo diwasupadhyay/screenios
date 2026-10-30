@@ -25,5 +25,44 @@ fn main() {
     println!("cargo:rerun-if-changed=src/decoder.cpp");
     println!("cargo:rerun-if-changed=screenios.png");
     println!("cargo:rustc-link-lib=comctl32");
+    println!("cargo:rustc-link-lib=shell32");
+    println!("cargo:rustc-link-lib=advapi32");
     println!("cargo:rerun-if-env-changed=FFMPEG_ROOT");
+    let compiler = cc::Build::new().cpp(true).get_compiler();
+    let mut helper = compiler.to_command();
+    helper
+        .args([
+            "/nologo",
+            "/std:c++20",
+            "/EHsc",
+            "/O2",
+            "/MD",
+            "/DNOMINMAX",
+            "/DWIN32_LEAN_AND_MEAN",
+            "/Ivendor/quicktime",
+        ])
+        .args([
+            "src/quicktime_helper.cpp",
+            "vendor/quicktime/Protocol/QuickTimePacket.cpp",
+            "vendor/quicktime/Protocol/QuickTimeSession.cpp",
+            "vendor/quicktime/Media/CoreMedia.cpp",
+        ])
+        .arg(format!("/Fo{}\\", output.display()))
+        .arg(format!(
+            "/Fe{}",
+            output.join("ScreenIOS.UsbCapture.exe").display()
+        ))
+        .args(["/link", ".local/libusb/libusb-1.0.lib", "advapi32.lib"]);
+    assert!(
+        helper.status().expect("Build USB capture helper").success(),
+        "USB capture helper compilation failed"
+    );
+    let profile = output.ancestors().nth(3).unwrap();
+    std::fs::copy(
+        output.join("ScreenIOS.UsbCapture.exe"),
+        profile.join("ScreenIOS.UsbCapture.exe"),
+    )
+    .unwrap();
+    println!("cargo:rerun-if-changed=src/quicktime_helper.cpp");
+    println!("cargo:rerun-if-changed=vendor/quicktime");
 }

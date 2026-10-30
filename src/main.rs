@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod decoder;
+mod driver;
+mod quicktime;
 mod transport;
 mod ui;
 pub fn log(message: &str) {
@@ -24,8 +26,8 @@ fn main() -> eframe::Result<()> {
                 )))
                 .expect("Project logo"),
             )
-            .with_inner_size([380., 240.])
-            .with_min_inner_size([360., 240.])
+            .with_inner_size([420., 480.])
+            .with_min_inner_size([420., 480.])
             .with_decorations(false)
             .with_resizable(true),
         renderer: eframe::Renderer::Glow,

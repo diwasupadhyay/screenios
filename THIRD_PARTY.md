@@ -14,3 +14,20 @@ FFmpeg's license is copied to the local distribution by build.ps1.
 No binary distributions or device data are committed to this repository.
 
 Other Rust dependencies and exact versions are recorded in Cargo.lock.
+
+The separate ScreenIOS.UsbCapture.exe helper uses QuickTime protocol sources
+from phh235/iphone-mirror-windows commit
+91e88e1423d2b7c253d4da1bcc951142e74ff035 (which vendors RayrenSX/iPhoneMirror).
+The helper is GPL-3.0-only; its complete corresponding source is in
+src/quicktime_helper.cpp and vendor/quicktime in this repository:
+https://github.com/diwasupadhyay/screenios . Build instructions: README.md.
+Changes remove the upstream frame-diagnostics dependency and add a USB-only
+capture process with bounded H.264 output. License: vendor/quicktime/LICENSE.
+libusb is dynamically linked by that helper under LGPL-2.1-or-later;
+its header and license are in vendor/quicktime. Runtime hashes are pinned in
+build.ps1. Upstream source: https://github.com/libusb/libusb .
+UsbDk 1.0.22 x64 is bundled in the local package under Apache-2.0, with its
+license retained in vendor/quicktime/USBDK-LICENSE. Source:
+https://github.com/daynix/UsbDk/tree/v1.00-22 . Installation is user-initiated
+and uses the original signed MSI with Windows elevation. Its SHA-256 is
+91F6F695E1E13C656024E6D3B55620BF08D8835EF05EE0496935BA6BB62466A5.

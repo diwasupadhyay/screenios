@@ -6,6 +6,8 @@
 /research/
 __pycache__/
 *.exe
+*.msi
+*.obj
 *.dll
 *.lib
 *.pdb

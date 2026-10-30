@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use std::ffi::c_void;
 
 unsafe extern "C" {
-    fn video_create(software: i32) -> *mut c_void;
+    fn video_create(software: i32, h264: i32) -> *mut c_void;
     fn video_decode(d: *mut c_void, data: *const u8, len: i32, w: i32, h: i32) -> i32;
     fn video_pixels(
         d: *mut c_void,
@@ -21,8 +21,8 @@ pub struct VideoFrame {
 }
 pub struct Decoder(*mut c_void);
 impl Decoder {
-    pub fn new(software: bool) -> Result<Self> {
-        let p = unsafe { video_create(software as i32) };
+    pub fn new(software: bool, h264: bool) -> Result<Self> {
+        let p = unsafe { video_create(software as i32, h264 as i32) };
         if p.is_null() {
             bail!("Video decoder could not load. Keep all four FFmpeg DLLs beside ScreenIOS.exe.");
         }

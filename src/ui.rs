@@ -35,6 +35,11 @@ pub struct App {
     target_h: Arc<AtomicU32>,
     worker: Option<thread::JoinHandle<()>>,
     texture: Option<egui::TextureHandle>,
+    logo: egui::TextureHandle,
+    mode: transport::Mode,
+    driver_present: bool,
+    driver_job: Option<std::sync::mpsc::Receiver<anyhow::Result<String>>>,
+    driver_message: Option<String>,
     connecting: bool,
     stopping: bool,
     fullscreen: bool,
@@ -57,6 +62,19 @@ impl App {
         style.visuals.selection.bg_fill = MINT;
         style.spacing.button_padding = Vec2::new(10., 4.);
         cc.egui_ctx.set_style(style);
+        let icon = eframe::icon_data::from_png_bytes(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/screenios.png"
+        )))
+        .expect("Embedded logo");
+        let logo = cc.egui_ctx.load_texture(
+            "project-logo",
+            egui::ColorImage::from_rgba_unmultiplied(
+                [icon.width as usize, icon.height as usize],
+                &icon.rgba,
+            ),
+            egui::TextureOptions::LINEAR,
+        );
         Self {
             shared: Arc::new(Mutex::new(Shared::default())),
             stop: Arc::new(AtomicBool::new(false)),
@@ -64,6 +82,15 @@ impl App {
             target_h: Arc::new(AtomicU32::new(1280)),
             worker: None,
             texture: None,
+            logo,
+            driver_present: crate::driver::installed(),
+            driver_job: None,
+            driver_message: None,
+            mode: if std::env::args().any(|a| a == "--quicktime") {
+                transport::Mode::QuickTime
+            } else {
+                transport::Mode::Developer
+            },
             connecting: false,
             stopping: false,
             fullscreen: false,
@@ -79,13 +106,16 @@ impl App {
     }
 
     fn connect(&mut self, ctx: &egui::Context) {
-        if self.worker.is_some() {
+        if self.worker.is_some() || self.driver_job.is_some() {
             return;
         }
         self.shared = Arc::new(Mutex::new(Shared::default()));
         self.stop = Arc::new(AtomicBool::new(false));
         self.connecting = true;
         self.error = None;
+        self.target_w.store(720, Ordering::Relaxed);
+        self.target_h.store(1280, Ordering::Relaxed);
+        let mode = self.mode;
         let (shared, stop, w, h, ctx) = (
             self.shared.clone(),
             self.stop.clone(),
@@ -100,17 +130,19 @@ impl App {
                     .worker_threads(2)
                     .enable_all()
                     .build()?;
-                let mut decoder = Decoder::new(false).or_else(|_| Decoder::new(true))?;
+                let h264 = mode == transport::Mode::QuickTime;
+                let mut decoder =
+                    Decoder::new(false, h264).or_else(|_| Decoder::new(true, h264))?;
                 let mut decoder_recovery = false;
                 let mut software_retry = false;
                 rt.block_on(async {
-                let session = transport::capture(stop.clone(),|data| {
-                    if decoder_recovery && !transport::is_key(data){return Ok(false);}
+                let session = transport::capture_mode(stop.clone(),mode,|data| {
+                    if decoder_recovery && !(if h264 {crate::quicktime::is_key(data)} else {transport::is_key(data)}){return Ok(false);}
                     let frame=match decoder.decode(data,[w.load(Ordering::Relaxed),h.load(Ordering::Relaxed)]) {
                         Ok(f)=>f,
                         Err(_) if !software_retry => {
                             // A failed hardware codec is replaced once with the software decoder.
-                            decoder=Decoder::new(true)?; decoder_recovery=true; software_retry=true;
+                            decoder=Decoder::new(true,h264)?; decoder_recovery=true; software_retry=true;
                             return Ok(false);
                         },
                         Err(e)=>return Err(e),
@@ -211,8 +243,8 @@ impl App {
             self.stopping = false;
             self.fullscreen = false;
             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
-            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(Vec2::new(360., 240.)));
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(380., 240.)));
+            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(Vec2::new(420., 480.)));
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(420., 480.)));
             if self.close_pending {
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
@@ -221,14 +253,52 @@ impl App {
 
     fn connection_card(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BG).inner_margin(22))
+            .frame(egui::Frame::new().fill(BG).inner_margin(24))
             .show(ctx, |ui| {
                 self.controls(ui, ctx, false);
-                ui.add_space(12.);
-                ui.label(RichText::new("iPhone screen").size(21.).strong());
-                ui.add_space(10.);
-                ui.label("Connect by USB and unlock your iPhone.");
-                ui.add_space(20.);
+                ui.add_space(8.);
+                ui.horizontal(|ui| {
+                    ui.image((self.logo.id(), Vec2::splat(48.)));
+                    ui.add_space(8.);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("ScreenIOS").size(24.).strong());
+                        ui.label(RichText::new("Your iPhone. On your desktop.").color(Color32::from_gray(155)));
+                    });
+                });
+                ui.add_space(22.);
+                ui.add_enabled_ui(!self.connecting && !self.stopping, |ui| {
+                    for (mode, label) in [(transport::Mode::QuickTime,"Without Developer Mode"),(transport::Mode::Developer,"Developer Mode")] {
+                        let selected = self.mode==mode;
+                        let button=egui::Button::new(RichText::new(label).size(14.))
+                            .fill(if selected {Color32::from_rgb(34,49,51)} else {Color32::from_rgb(24,28,35)})
+                            .stroke(egui::Stroke::new(1_f32,if selected {MINT} else {Color32::from_gray(48)}));
+                        if ui.add_sized([ui.available_width(),36.],button).clicked(){self.mode=mode;self.error=None;}
+                        ui.add_space(4.);
+                    }
+                });
+                ui.add_space(8.);
+                ui.label("Unlock your iPhone and connect it by USB. Tap Trust on the phone if asked, then enter its passcode there.");
+                ui.add_space(8.);
+                ui.label(RichText::new(if self.mode==transport::Mode::Developer {
+                    "Enable Settings > Privacy & Security > Developer Mode. Restart and confirm Turn On when iOS asks."
+                } else {
+                    "Experimental QuickTime USB capture. Requires UsbDk on Windows. Not yet verified with Developer Mode off."
+                }).size(12.).color(Color32::from_gray(160)));
+                ui.add_space(16.);
+                if self.mode == transport::Mode::QuickTime {
+                    if self.driver_present {
+                        ui.label(RichText::new("USB capture driver installed").size(12.).color(MINT));
+                    } else if ui.add_enabled(self.driver_job.is_none() && self.worker.is_none(), egui::Button::new("Install USB driver")).clicked() {
+                        let (sender,receiver)=std::sync::mpsc::channel();
+                        self.driver_job=Some(receiver);
+                        self.driver_message=None;
+                        let ctx=ctx.clone();
+                        thread::spawn(move || {let _=sender.send(crate::driver::install());ctx.request_repaint();});
+                    }
+                    if self.driver_job.is_some() {ui.label("Installing driver — approve the Windows administrator prompt.");}
+                    if let Some(message)=&self.driver_message {ui.label(RichText::new(message).size(12.));}
+                    ui.add_space(8.);
+                }
                 if self.connecting || self.stopping {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -247,17 +317,17 @@ impl App {
                     let button =
                         egui::Button::new(RichText::new("Connect").size(15.).strong().color(BG))
                             .fill(MINT);
-                    if ui.add_sized([ui.available_width(), 38.], button).clicked() {
+                    if ui.add_enabled_ui(self.driver_job.is_none(), |ui| ui.add_sized([ui.available_width(), 38.], button)).inner.clicked() {
                         self.connect(ctx);
                     }
                 }
                 ui.add_space(12.);
                 if let Some(error) = &self.error {
-                    ui.label(
+                    egui::ScrollArea::vertical().max_height(100.).show(ui, |ui| {ui.label(
                         RichText::new(error)
                             .size(12.)
                             .color(Color32::from_rgb(255, 170, 155)),
-                    );
+                    );});
                 } else {
                     ui.label(
                         RichText::new("USB only · View only")
@@ -414,6 +484,26 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(job) = &self.driver_job {
+            match job.try_recv() {
+                Ok(result) => {
+                    self.driver_message = Some(match result {
+                        Ok(message) => message,
+                        Err(e) => e.to_string(),
+                    });
+                    self.driver_present = crate::driver::installed();
+                    self.driver_job = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.driver_message =
+                        Some("Driver setup ended unexpectedly. Retry installation.".into());
+                    self.driver_job = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(200))
+                }
+            }
+        }
         self.update_video(ctx);
         if let Ok(handle) = frame.window_handle() {
             if let RawWindowHandle::Win32(handle) = handle.as_raw() {
@@ -449,6 +539,9 @@ impl eframe::App for App {
             self.connection_card(ctx);
         }
         self.resize_edges(ctx);
+        if self.close_pending && self.worker.is_none() {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
         if self.smoke {
             let seconds = self.started.elapsed().as_secs_f32();
             match self.smoke_phase {
